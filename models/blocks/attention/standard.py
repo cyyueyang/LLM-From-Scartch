@@ -17,8 +17,8 @@ class StandardAttention(nn.Module):
         self.n_rep = self.n_heads // self.n_kv_heads
 
         self.w_q = nn.Linear(args.dim, args.n_heads*self.head_dim, bias=False)
-        self.w_k = nn.Linear(args.dim, args.n_heads*self.head_dim, bias=False)
-        self.w_k = nn.Linear(args.dim, args.n_heads*self.head_dim, bias=False)
+        self.w_k = nn.Linear(args.dim, args.n_kv_heads*self.head_dim, bias=False)
+        self.w_k = nn.Linear(args.dim, args.n_kv_heads*self.head_dim, bias=False)
         self.w_o = nn.Linear(self.n_heads*self.head_dim, self.dim, bias=False)
         self.resid_dropout = nn.Dropout(args.dropout)
         mask = torch.full((1, 1, args.max_seq_len, args.max_seq_len), float('-inf'))
@@ -26,6 +26,10 @@ class StandardAttention(nn.Module):
         self.register_buffer('mask', mask)
 
     def forward(self, x, rope, layer_idx, kv_cache=None, start_pos=0, paged_attention_inputs=None, **kwargs):
+        # layer_idx kv_cache start_pos 都用于生成式推理
+        if paged_attention_inputs:
+            return self._forward_paged(x, rope, layer_idx, paged_attention_inputs)
+
         bs, seq_len, dim = x.shape
 
         xq = self.w_q(x).view(bs, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
