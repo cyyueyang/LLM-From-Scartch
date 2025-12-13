@@ -64,7 +64,7 @@ class StandardAttention(nn.Module):
         # 用于推理时处理长序列，通过分块KV缓存节省内存    分页cache [num_blocks, n_layers, n_kv_heads, block_size, head_dim] 块表 [bs, max_blocks_per_seq] 记录每个序列用了哪些内存块
         # x [total_tokens, dim]
         # paged_inputs包含: positions, tokens_per_seq, context_lengths, k_cache, v_cache, block_tables
-        # 每个token位置 新token数量 序列总长度 kv cache 块表（每个序列的块映射）
+        # 每个token的位置索引 每个序列的token数 每个序列的上下文长度 分块的键值缓存 块表（记录每个序列使用了哪些块）
         positions, tokens_per_seq, context_lengths, k_cache, v_cache, block_tables = paged_inputs
         # （total_tokens, n_heads, head_dim)
         xq = self.w_q(x).view(-1, self.n_heads, self.head_dim)
