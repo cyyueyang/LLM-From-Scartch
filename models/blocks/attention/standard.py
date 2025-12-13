@@ -33,8 +33,8 @@ class StandardAttention(nn.Module):
         bs, seq_len, dim = x.shape
 
         xq = self.w_q(x).view(bs, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        xk = self.w_k(x).view(bs, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        xv = self.w_o(x).view(bs, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        xk = self.w_k(x).view(bs, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        xv = self.w_o(x).view(bs, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
         xq = rope.apply_rotary_emb(xq)
         xk = rope.apply_rotary_emb(xk)
