@@ -50,3 +50,46 @@ class StandardKVCache(KVCacheBase):
         values = self.cache_v[layer_idx, :bs, :, :start_pos + seq_len, :]
         return keys, values
 
+class LatentKVCache(KVCacheBase):
+    def __init__(self,
+                 max_batch_size: int,
+                 max_seq_len: int,
+                 n_layers: int,
+                 kv_lora_rank: int,
+                 rope_head_dim: int,
+                 device: torch.device,
+                 dtype: torch.dtype
+                 ) -> None:
+        super().__init__()
+
+        self.cache_latent = torch.zero(
+            (n_layers, max_batch_size, max_seq_len, kv_lora_rank),
+            dtype=dtype,
+            device=device
+        )
+
+        self.cache_k_rope = torch.zeros(
+            (n_layers, max_batch_size, max_seq_len, kv_lora_rank),
+            dtype=dtype,
+            device=device
+        )
+
+    def update(self, layer_idx: int, start_pos: int, c_kv: torch.Tensor, k_rope: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        更新潜变量缓存
+        :param layer_idx: 层索引
+        :param start_pos: 开始位置
+        :param c_kv: 潜变量
+        :param k_rope: rope后的k
+        :return: 完整 潜变量缓存 和 k_rope缓存
+        """
+
+        bs, seq_len, kv_lora_rank = c_kv.shape
+
+        self.cache_latent[layer_idx, :bs, start_pos:start_pos + seq_len, :] = c_kv
+        self.cache_k_rope[layer_idx, :bs, start_pos:start_pos + seq_len, :] = k_rope
+
+        full_c_kv = self.cache_latent[layer_idx, :bs, :start_pos + seq_len, :]
+        full_k_rope = self.cache_k_rope[layer_idx, :bs, :start_pos + seq_len, :]
+
+        return full_c_kv, full_k_rope
