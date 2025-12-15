@@ -3,6 +3,8 @@ import math
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
+
+from inference.engine.kv_cache import LatentKVCache
 from ..normalization.normalization import RMSNorm
 
 
@@ -129,7 +131,108 @@ class StandardAttention(nn.Module):
         return self.resid_dropout(self.w_o(output_flat))
 
 
+class MultiHeadLatentAttention(torch.nn.Module):
+    def __init__(self, args):
+        super(MultiHeadLatentAttention, self).__init__()
 
+        self.dim = args.dim
+        self.n_heads = args.n_heads
+        self.q_lora_rank = args.q_lora_rank
+        self.kv_lora_rank = args.kv_lora_rank
+        self.nope_head_dim = args.nope_head_dim
+        self.rope_head_dim = args.rope_head_dim
+        self.v_head_dim = args.v_head_dim
+
+        # q_lora_rank == 0  禁用 q 压缩
+        if self.q_lora_rank > 0:
+            self.wq_down = nn.Linear(self.dim, self.q_lora_rank, bias=False)
+            self.wq_up = nn.Linear(self.q_lora_rank, self.n_heads*self.nope_head_dim, bias=False)
+            self.wq_rope= nn.Linear(self.q_lora_rank, self.n_heads*self.rope_head_dim, bias=False)
+            self.q_norm = RMSNorm(self.q_lora_rank, eps=args.norm_eps)
+        else:
+            self.wq_up = nn.Linear(self.dim, self.n_heads*self.nope_head_dim, bias=False)
+            self.wq_rope = nn.Linear(self.dim, self.n_heads*self.rope_head_dim, bias=False)
+
+        # kv down
+        self.wkv_down = nn.Linear(self.dim, self.kv_lora_rank, bias=False)
+        self.kv_norm = RMSNorm(self.kv_lora_rank, eps=args.norm_eps)
+
+        # kv up
+        self.wkv_up = nn.Linear(self.kv_lora_rank, self.n_heads*(self.nope_head_dim+self.v_head_dim), bias=False)
+        #k rope
+        self.wk_rope = nn.Linear(self.dim, self.rope_head_dim, bias=False)
+
+        self.wo = nn.Linear(self.n_heads*self.v_head_dim, args.dim, bias=False)
+
+        mask = torch.full((1, 1, args.max_seq_len, args.max_seq_len), float('-inf'))
+        mask = torch.triu(mask, diagonal=1)
+        self.register_buffer('mask', mask)
+
+    def forward(self, x, rope, layer_idx, kv_chache=None, start_pos=0, paged_attention_inputs=None, **kwargs):
+        bs, seq_len, dim = x.shape
+
+        if kv_chache is None and seq_len == 1:
+            assert isinstance(kv_chache, LatentKVCache) "MLA requires kv_chache to be a LatentKVCache"
+            return self._forward_inference_optimized(x, rope, layer_idx, kv_chache, start_pos)
+
+        if paged_attention_inputs is not None:
+            raise NotImplementedError("Paged attention inputs not yet implemented")
+
+        if self.q_lora_rank > 0:
+            q_compressed = self.wq_down(x)
+            q_compressed = self.q_norm(q_compressed)
+            q_nope = self.wq_up(q_compressed).view(bs, seq_len, self.n_heads, self.nope_head_dim)
+            q_pe = self.wq_rope(q_compressed).view(bs, seq_len, self.n_heads, self.rope_head_dim)
+        else:
+            q_nope = self.wq_up(x).view(bs, seq_len, self.n_heads, self.nope_head_dim)
+            q_pe = self.wq_rope(x).view(bs, seq_len, self.n_heads, self.rope_head_dim)
+
+        kv_compressed = self.wkv_down(x)
+        kv_compressed = self.kv_norm(kv_compressed)
+
+        kv_up = self.wkv_up(kv_compressed).view(bs, seq_len, self.n_heads, self.nope_head_dim)
+        k_nope, v = torch.split(kv_up, [self.nope_head_dim, self.v_head_dim], dim=-1)
+
+        k_rope_shared = self.wk_rope(x).view(bs, seq_len, 1, self.rope_head_dim)
+
+        if kv_chache is not None:
+            k_rope_for_cache = k_rope_shared.squeeze(2)
+            kv_chache.update(layer_idx, start_pos, kv_compressed, k_rope_for_cache)
+
+        # [bs, seq_len, n_heads, head_dim] -> [bs, n_heads, seq_len, head_dim]
+        q_pe = q_pe.permute(0, 2, 1, 3)
+        k_rope_shared = k_rope_shared.permute(0, 2, 1, 3)
+
+        q_pe = rope.apply_rotary_emb(q_pe)
+        k_rope_shared = rope.apply_rotary_emb(k_rope_shared)
+
+        # [bs, n_heads, seq_len, head_dim] -> [bs, seq_len, n_heads, head_dim]
+        q_pe = q_pe.permute(0, 2, 1, 3)
+        k_rope_shared = k_rope_shared.permute(0, 2, 1, 3)
+
+        k_rope = k_rope_shared.expand(-1, -1, self.n_heads, -1)
+
+        q = torch.cat([q_nope, q_pe], dim=-1)
+        k = torch.cat([k_nope, k_rope], dim=-1)
+
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
+
+        scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.nope_head_dim + self.rope_head_dim)
+
+        if seq_len > 1:
+            local_mask = self.mask[:, :seq_len, :seq_len]
+            scores = scores + local_mask
+
+        probs = F.softmax(scores, dim=-1)
+        output = torch.matmul(probs, v)
+        output = output.permute(0, 2, 1, 3).contiguous().view(bs, seq_len, -1)
+        output = self.wo(output)
+        return output
+
+    def _forward_inference_optimized(self, x, rope, layer_idx, kv_cache: LatentKVCache, start_pos: int):
+        pass
 
 
 
