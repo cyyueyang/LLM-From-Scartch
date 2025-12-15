@@ -69,7 +69,7 @@ class LatentKVCache(KVCacheBase):
         )
 
         self.cache_k_rope = torch.zeros(
-            (n_layers, max_batch_size, max_seq_len, kv_lora_rank),
+            (n_layers, max_batch_size, max_seq_len, rope_head_dim),
             dtype=dtype,
             device=device
         )
