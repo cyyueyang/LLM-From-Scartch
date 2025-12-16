@@ -172,7 +172,7 @@ class MultiHeadLatentAttention(torch.nn.Module):
         bs, seq_len, dim = x.shape
 
         if kv_chache is None and seq_len == 1:
-            assert isinstance(kv_chache, LatentKVCache) "MLA requires kv_chache to be a LatentKVCache"
+            assert isinstance(kv_chache, LatentKVCache), "MLA requires kv_chache to be a LatentKVCache"
             return self._forward_inference_optimized(x, rope, layer_idx, kv_chache, start_pos)
 
         if paged_attention_inputs is not None:
@@ -232,7 +232,85 @@ class MultiHeadLatentAttention(torch.nn.Module):
         return output
 
     def _forward_inference_optimized(self, x, rope, layer_idx, kv_cache: LatentKVCache, start_pos: int):
-        pass
+        bs, seq_len, dim = x.shape
+        assert seq_len == 1, "inference_optimized only supports seq_len=1"
+        # 处理Query
+        if self.q_lora_rank > 0:
+            q_compressed = self.wq_down(x)
+            q_compressed = self.q_norm(q_compressed)
+            q_nope = self.wq_up(q_compressed).view(bs, seq_len, self.n_heads, self.nope_head_dim)
+            q_pe = self.wq_rope(x).view(bs, seq_len, self.n_heads, self.rope_head_dim)
+        else:
+            q_nope = self.wq_up(x).view(bs, seq_len, self.n_heads, self.nope_head_dim)
+            q_pe = self.wq_rope(x).view(bs, seq_len, self.n_heads, self.rope_head_dim)
+        # 处理KV
+        kv_compressed = self.wkv_down(x)
+        kv_compressed = self.kv_norm(kv_compressed)
+        # Rope
+        k_rope_shared = self.wk_rope(x).view(bs, seq_len, self.rope_head_dim)
+
+        positons = torch.arange(start_pos, start_pos+seq_len, device=x.device, dtype=torch.long)
+        positons = positons.unsqueeze(0).expand(bs, -1).flatten()
+
+        q_pe_flat = q_pe.view(bs*seq_len, self.n_heads, self.rope_head_dim)
+        q_pe_out = rope.apply_rotary_emb_paged(q_pe_flat, positons)
+        q_pe = q_pe_out.view(bs, seq_len, self.n_heads, self.rope_head_dim).transpose(1, 2)
+
+        k_rope_flat = k_rope_shared.view(bs*seq_len, 1, self.rope_head_dim)
+        k_rope_flat = rope.apply_rotary_emb_paged(k_rope_flat, positons)
+        k_rope_shared = k_rope_flat.view(bs, seq_len, self.rope_head_dim)
+
+        # 更新cache
+        full_c_kv, full_k_rope = kv_cache.update(layer_idx, start_pos, kv_compressed, k_rope_shared)
+
+        # 核心优化部分
+        # 计算S_pe部分
+        k_rope_history_heads = full_k_rope.unsqueeze(1) #[bs, 1, full_seq_len, rope_dim]
+        score_pe = torch.matmul(q_pe, k_rope_history_heads.transpose(-1, -2))
+
+        # 计算S_nope
+        w_up_weight = None
+        # 如果是量化模型
+        if hasattr(self.wkv_up, '_packed_params'):
+            if hasattr(self.wkv_up._packed_params, 'unpack'):
+                w_up_weight, _ = self.wkv_up._packed_params.unpack()
+            else:
+                try:
+                    w_up_weight, _ = torch.ops.quantized._unpack(self.wkv_up._packed_params)
+
+                except Exception as e:
+                    raise RuntimeError(f"Failed to unpack w_up_weight: {e}")
+
+        else:
+            w_up_weight = self.wkv_up.weight
+
+        head_dim_total = self.nope_head_dim + self.v_head_dim
+        w_up_reshaped = w_up_weight.view(self.n_heads, head_dim_total, self.kv_lora_rank)
+        w_uk = w_up_reshaped[:, :self.nope_head_dim, :]
+        w_uv = w_up_reshaped[:, self.nope_head_dim:, :]
+
+        q_nope_heads = q_nope.transpose(1, 2)
+        q_absorbed = torch.einsum('b h t d, h, d, r -> b h t r', q_nope_heads, w_uk)
+        scores_nope = torch.matmul(q_absorbed, full_c_kv.transpose(1, 2)).unsqueeze(1)
+
+        scores = (score_pe + scores_nope) / math.sqrt(self.nope_head_dim + self.rope_head_dim)
+
+        probs = F.softmax(scores.float(), dim=-1).type_as(x)
+
+        latent_output = torch.matmul(probs, full_c_kv.unsqueeze(1))
+        output = torch.einsum('b h t r, h v r', latent_output, w_uv)
+        output = output.transpose(1, 2).contiguous().view(bs, seq_len, -1)
+        output = self.wo(output)
+        return output
+
+
+
+
+
+
+
+
+
 
 
 
